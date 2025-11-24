@@ -1,0 +1,554 @@
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(stacks)
+```
+
+```{r}
+hrt <- read_csv("D:/work/machine learning/bases/hrt.csv")
+glimpse(hrt)
+```
+
+
+```{r}
+
+hrt <- hrt %>%
+  mutate(
+    attrition = as.factor(attrition),
+    education = as.factor(education),
+    environment_satisfaction = as.factor(environment_satisfaction),
+    job_involvement = as.factor(job_involvement),
+    job_level = as.factor(job_level),
+    job_satisfaction = as.factor(job_satisfaction),
+    performance_rating = as.factor(performance_rating),
+    relationship_satisfaction = as.factor(relationship_satisfaction),
+    stock_option_level = as.factor(stock_option_level),
+    work_life_balance = as.factor(work_life_balance)
+  )
+```
+
+```{r}
+# Relevel to make "Yes" the positive/event class
+hrt$attrition <- relevel(hrt$attrition, ref = "Yes")
+
+
+
+levels(hrt$attrition)
+```
+
+
+
+
+```{r}
+summary(hrt)
+
+```
+
+
+```{r}
+# 2. Generate the plot
+attrition_plot <- hrt %>%
+  # Start the plot, mapping Attrition to the x-axis
+  ggplot(aes(x = attrition)) +
+  
+  # Create the bar chart (geom_bar is perfect for count distributions)
+  # The 'fill' color is set for aesthetic purposes
+  geom_bar(fill = "#0072B2") +
+  
+  # Add count labels on top of the bars
+  geom_text(
+    stat = 'count',            # Calculate the count for text label
+    aes(label = after_stat(count)), # Use the calculated count as the label
+    vjust = -0.5,              # Position the label slightly above the bar
+    color = "black",
+    size = 4
+  ) +
+  
+  # Customize the labels and titles for clarity
+  labs(
+    title = "Distribution of Employee Attrition",
+    subtitle = "Target Class Balance (Yes vs. No)",
+    x = "Attrition Class",
+    y = "Count of Employees"
+  ) +
+  
+  # Improve the visual appearance
+  theme_minimal() +
+  
+  # Customize the plot theme (e.g., center the title)
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+# 3. Display the plot
+print(attrition_plot)
+```
+The data shows a severe class imbalance in Attrition we address it by Adjusting the threshold.
+
+
+```{r}
+set.seed(2024)
+hrt_split <- hrt %>% initial_split(prop = 0.8,strata = attrition)
+hrt_train <- hrt_split %>% training()
+hrt_test <- hrt_split %>% testing()
+```
+
+```{r}
+hrt_rec <- hrt_train %>%
+recipe(attrition ~ .) %>%
+step_impute_mode(all_nominal_predictors()) %>%
+step_impute_median(all_numeric_predictors()) %>%
+step_normalize(all_numeric_predictors()) %>%
+step_dummy(all_nominal_predictors())
+```
+**XGBOOST:
+```{r}
+library(xgboost)
+
+# Model specification (tunable XGBoost)
+hrt_tune_xgb <- boost_tree(
+  trees = 1000,                 # total number of trees (boosting rounds)
+  tree_depth = tune(),          # depth of each tree
+  learn_rate = tune(),          # learning rate (eta)
+  min_n = tune(),               # minimum child weight
+  mtry = tune()                 # number of predictors randomly selected at each split
+) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost")
+
+# Workflow 
+hrt_wf_xgb <- workflow() %>%
+  add_model(hrt_tune_xgb) %>%
+  add_recipe(hrt_rec)
+
+```
+
+```{r}
+# Define grid for XGBoost tuning
+hrt_grid_xgb <- grid_space_filling(
+  tree_depth(range = c(2, 10)),         # how deep each tree can grow
+  learn_rate(range = c(0.001, 0.3)),    # learning rate (eta)
+  min_n(range = c(1, 20)),              # minimum child weight
+  finalize(mtry(), hrt_train),        # adjusts mtry to number of predictors
+  size = 20                             # number of combinations in the grid
+)
+```
+
+```{r}
+# Cross-validation folds for all the models
+
+hrt_cv <- hrt_train %>%
+  vfold_cv(v = 5, strata = attrition)
+```
+
+```{r}
+# Tuning
+hrt_res_xgb <- hrt_wf_xgb %>%
+  tune_grid(
+    resamples = hrt_cv,
+    grid = hrt_grid_xgb,
+    control = control_stack_grid()  
+  )
+```
+
+```{r}
+# Best hyperparameters
+hrt_res_xgb %>% show_best(metric = "roc_auc", n = 10)
+
+hrt_best_xgb <- hrt_res_xgb %>%
+  select_best(metric = "roc_auc")
+hrt_best_xgb
+
+# Final workflow and fit
+hrt_wf_final_xgb <- hrt_wf_xgb %>%
+  finalize_workflow(hrt_best_xgb)
+hrt_wf_final_xgb
+
+hrt_fit_xgb <- last_fit(hrt_wf_final_xgb, split = hrt_split)
+hrt_fit_xgb
+hrt_fit_xgb %>% extract_fit_engine() %>% vip::vip()
+```
+monthly_income and over_time_Yes  are the most important features 
+
+```{r}
+# Predictions & Confusion Matrix
+ hrt_preds_xgb <-hrt_fit_xgb %>%
+  collect_predictions() 
+ # Add a column for your thresholded class predictions
+hrt_preds_xgb <- hrt_preds_xgb %>%
+  mutate(
+    pred_class_thr = if_else(.pred_Yes > 0.35, "Yes", "No") %>% factor(levels = c("Yes", "No"))
+  )
+
+#metrics
+
+metric_xgb <- metric_set(accuracy, recall, specificity, precision, f_meas,roc_auc)
+custom_metric(hrt_preds_xgb , truth = attrition, estimate = pred_class_thr)
+
+#Calculate Confusion Matrix
+conf_mat(hrt_preds_xgb, truth = attrition, estimate = pred_class_thr)
+
+
+# ROC Curve
+roc_xgb<-hrt_fit_xgb %>%
+  collect_predictions() %>%
+  roc_curve(truth = attrition, .pred_Yes) %>%  
+  autoplot()
+roc_xgb
+
+```
+
+82% of predictions are correct overall.
+41% of true leavers are correctly identified.
+90% of employees who stay are correctly classified as “No”.
+45% of employees flagged as “at risk” truly are at risk.
+ moderate balance between recall and precision.
+
+**LGBM:
+
+```{r}
+library(bonsai)
+library(lightgbm)
+
+# Model specification
+hrt_tune_lgbm <- boost_tree(
+  trees = 1000,              # number of boosting iterations
+  tree_depth = tune(),       # maximum depth of a tree
+  learn_rate = tune(),       # learning rate
+  min_n = tune(),            # min number of data in a leaf
+  mtry = tune(),             # number of variables randomly sampled at each split
+) %>%
+  set_mode("classification") %>%
+  set_engine("lightgbm")
+```
+
+
+```{r}
+# Workflow
+hrt_wf_lgbm <- workflow() %>%
+  add_model(hrt_tune_lgbm) %>%  
+  add_recipe(hrt_rec)            
+
+# Parameter grid
+hrt_grid_lgbm <- grid_space_filling(
+  tree_depth(range = c(2, 12)),
+  learn_rate(range = c(0.001, 0.3)),
+  min_n(range = c(1, 20)),
+  finalize(mtry(), hrt_train),      
+  size = 20
+)
+```
+
+
+```{r}
+# Model tuning
+hrt_res_lgbm <- hrt_wf_lgbm %>%
+  tune_grid(
+    resamples = hrt_cv,
+    grid = hrt_grid_lgbm,
+    control = control_stack_grid()
+  )
+```
+
+```{r}
+# Evaluate tuning results
+hrt_res_lgbm %>%
+  show_best(metric = "roc_auc", n = 10)
+
+hrt_best_lgbm <- hrt_res_lgbm %>%
+  select_best(metric = "roc_auc")
+hrt_best_lgbm
+
+# Finalize workflow with best parameters
+hrt_wf_final_lgbm <- hrt_wf_lgbm %>%
+  finalize_workflow(hrt_best_lgbm)
+hrt_wf_final_lgbm
+
+# Fit final model on training/test split
+hrt_fit_lgbm <- last_fit(hrt_wf_final_lgbm, split = hrt_split)
+hrt_fit_lgbm
+
+# Collect metrics
+metrics_lgbm <- hrt_fit_lgbm %>%
+  collect_metrics()
+metrics_lgbm
+hrt_fit_lgbm %>% extract_fit_engine() %>% vip::vip()
+# Predictions & Confusion Matrix
+hrt_preds_lgbm <- hrt_fit_lgbm %>%
+  collect_predictions() 
+  # Add a column for your thresholded class predictions
+hrt_preds_lgbm<- hrt_preds_lgbm %>%
+  mutate(
+    pred_class_thr = if_else(.pred_Yes > 0.35, "Yes", "No") %>% factor(levels = c("Yes", "No"))
+  )  
+#metrics
+metric_lgbm <- metric_set(accuracy, recall, specificity, precision, f_meas)
+
+custom_metric(hrt_preds_lgbm , truth = attrition, estimate = pred_class_thr)
+
+#Calculate Confusion Matrix
+conf_mat(hrt_preds_lgbm, truth = attrition, estimate = pred_class_thr)
+
+# ROC Curve
+roc_lgbm<-hrt_fit_lgbm %>%
+  collect_predictions() %>%
+  roc_curve(truth = attrition, .pred_Yes) %>%               
+  autoplot()
+roc_lgbm
+```
+
+84% of predictions are correct overall.
+33% of employees who leave (attrition “Yes”) are identified.
+94% of “No” cases (employees who stay) are correctly classified.
+55% of  “at risk” predictions are correct.
+ a moderate balance between recall and precision.
+
+
+
+**ADABOOST:
+```{r}
+# Model specification
+hrt_tune_ada <- boost_tree(
+  trees = tune(),          # number of boosting iterations (trees)
+  min_n = tune()           # minimum observations in a terminal node (min_n)
+) %>%
+  set_mode("classification") %>%
+  set_engine("C5.0")
+```
+
+```{r}
+# Workflow
+hrt_wf_ada <- workflow() %>%
+  add_model(hrt_tune_ada) %>%    
+  add_recipe(hrt_rec)            
+
+# Parameter grid
+hrt_grid_ada <- grid_regular(
+  trees(range = c(1, 50)),        
+  min_n(range = c(2, 20)),
+  levels = 10                      
+)
+
+
+
+# Model tuning
+hrt_res_ada <- hrt_wf_ada %>%
+  tune_grid(
+    resamples = hrt_cv,
+    grid = hrt_grid_ada,
+    control = control_stack_grid()
+  )
+```
+
+
+```{r}
+# Evaluate tuning results
+hrt_res_ada %>%
+  show_best(metric = "roc_auc", n = 10)
+
+hrt_best_ada <- hrt_res_ada %>%
+  select_best(metric = "roc_auc")
+hrt_best_ada
+
+# Finalize workflow with best parameters
+hrt_wf_final_ada <- hrt_wf_ada %>%
+  finalize_workflow(hrt_best_ada)
+hrt_wf_final_ada
+
+# Fit final model on training/test split
+hrt_fit_ada <- last_fit(hrt_wf_final_ada, split = hrt_split)
+hrt_fit_ada
+
+# Collect metrics
+metrics_ada <- hrt_fit_ada %>%
+  collect_metrics()
+metrics_ada
+
+# Predictions 
+hrt_preds_ada <- hrt_fit_ada %>%
+  collect_predictions()
+```
+
+```{r}
+# Add a column for your thresholded class predictions
+hrt_preds_ada <- hrt_preds_ada %>%
+  mutate(
+    pred_class_thr = if_else(.pred_Yes > 0.35, "Yes", "No") %>% factor(levels = c("Yes", "No"))
+  )
+
+#metrics
+
+custom_metric <- metric_set(accuracy, recall, specificity, precision, f_meas)
+custom_metric(hrt_preds_ada , truth = attrition, estimate = pred_class_thr)
+
+#Calculate Confusion Matrix
+conf_mat(hrt_preds_ada, truth = attrition, estimate = pred_class_thr)
+
+# ROC Curve 
+roc_ada<-hrt_fit_ada %>%
+  collect_predictions() %>%
+  roc_curve(truth = attrition, .pred_Yes ) %>%
+  autoplot()
+roc_ada
+```
+This means the model is able to achieve high sensitivity (recall for “Yes”) with low rates of false positives (high specificity) at several thresholds.
+
+Accuracy: 0.84
+84% of all predictions are correct.
+
+
+Recall (Sensitivity, “Yes”): 0.47
+47% of actual attrition cases (“Yes”) are detected by the model.
+
+Specificity (“No”): 0.91
+91% of true “No” cases (employees who stay) are correctly identified.
+
+Precision (“Yes”): 0.51
+When our model predicts “Yes,” it is correct 51% of the time.
+
+
+***Stacking
+
+```{r}
+
+
+# Create an empty stack (ensemble)
+hrt_stack <- stacks() %>%
+  # Add tuned results for your models
+  add_candidates(hrt_res_ada) %>%
+  add_candidates(hrt_res_xgb) %>%
+  add_candidates(hrt_res_lgbm)
+```
+
+```{r}
+# Blend predictions (find weights for base models)
+hrt_stack <- hrt_stack %>% blend_predictions()
+
+# Fit final stacked ensemble
+hrt_fit_stack <- hrt_stack %>% fit_members()
+```
+
+
+```{r}
+# 1. Predict probabilities for the 'Yes' class using the stacked ensemble
+stacked_preds <- predict(hrt_fit_stack, hrt_test, type = "prob") %>%
+  bind_cols(hrt_test)
+
+
+stacked_preds <- stacked_preds %>%
+  mutate(
+    pred_class_thr = if_else(.pred_Yes > 0.35, "Yes", "No") %>% factor(levels = c("Yes", "No"))
+  )
+```
+
+
+```{r}
+# 3. Evaluate metrics using the thresholded class predictions
+custom_metric <- metric_set(accuracy, recall, specificity, precision, f_meas)
+custom_metric(stacked_preds , truth = attrition, estimate = pred_class_thr)
+
+# 4. Compute the confusion matrix using thresholded predictions
+conf_matrix <- stacked_preds %>%
+  conf_mat(truth = attrition, estimate = pred_class_thr)
+
+print(conf_matrix)
+
+# ROC Curve
+
+roc_stacking <- stacked_preds %>%
+  roc_curve(truth = attrition, .pred_Yes) %>%
+  autoplot()
+print(roc_stacking)
+
+```
+
+86% correct predictions overall.
+the model correctly identifying 41% of employees who will leave.
+95% of stayers correctly classified
+64% of “at risk” predictions are correct
+Good balance between recall and precision.
+
+##ROC CURVE
+The ROC Curve confirms the stacked ensemble model has excellent discriminatory power to distinguish between employees who will leave (Attrition "Yes") and those who will stay (Attrition "No"), as the curve lies far above the diagonal line
+
+```{r}
+
+
+
+
+# Define the full set of metrics
+custom_metric_set <- metric_set(accuracy, recall, specificity, precision, f_meas)
+
+# Calculate and label metrics for each model
+metrics_xgb <- custom_metric_set(hrt_preds_xgb, truth = attrition, estimate = pred_class_thr) %>%
+  mutate(Model = "XGBoost")
+
+metrics_lgbm <- custom_metric_set(hrt_preds_lgbm, truth = attrition, estimate = pred_class_thr) %>%
+  mutate(Model = "LightGBM")
+
+metrics_ada <- custom_metric_set(hrt_preds_ada, truth = attrition, estimate = pred_class_thr) %>%
+  mutate(Model = "AdaBoost")
+
+metrics_stack <- custom_metric_set(stacked_preds, truth = attrition, estimate = pred_class_thr) %>%
+  mutate(Model = "Stacked Ensemble")
+
+# Combine all metrics into one table
+all_metrics_combined <- bind_rows(metrics_xgb, metrics_lgbm, metrics_ada, metrics_stack)
+
+# Display the combined metrics table
+print("Performance Metrics (Thresholded at 0.35):")
+print(all_metrics_combined)
+
+
+# --- 2. Combine and Plot ROC Curves ---
+
+# Generate ROC curve data for each model
+roc_data_xgb <- hrt_preds_xgb %>% roc_curve(truth = attrition, .pred_Yes) %>% mutate(Model = "XGBoost")
+roc_data_lgbm <- hrt_preds_lgbm %>% roc_curve(truth = attrition, .pred_Yes) %>% mutate(Model = "LightGBM")
+roc_data_ada <- hrt_preds_ada %>% roc_curve(truth = attrition, .pred_Yes) %>% mutate(Model = "AdaBoost")
+roc_data_stack <- stacked_preds %>% roc_curve(truth = attrition, .pred_Yes) %>% mutate(Model = "Stacked Ensemble")
+
+# Combine all ROC data frames
+all_roc_data <- bind_rows(roc_data_xgb, roc_data_lgbm, roc_data_ada, roc_data_stack)
+
+# Define a custom color palette and the order you want them to appear in the legend
+# We will use distinct colors and place the Stacked Ensemble first.
+model_colors <- c(
+  "Stacked Ensemble" = "purple",  # Bold color for the best model
+  "LightGBM" = "#7CAE00",         # Green
+  "XGBoost" = "#00BFC4",          # Cyan/Light Blue
+  "AdaBoost" = "#F8766D"          # Red/Orange
+)
+
+# Define the order for the legend items
+model_order <- c("Stacked Ensemble", "LightGBM", "XGBoost", "AdaBoost")
+
+# Combine and Plot ROC Curves with Manual Control
+roc_comparison_plot <- all_roc_data %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = Model)) +
+  
+  # Add the ROC curves
+  geom_path(linewidth = 1.2, alpha = 0.8) +
+  
+  # Add the diagonal line for baseline (AUC = 0.5)
+  geom_abline(lty = 2, color = "gray50") + 
+  
+  # ADD THIS BLOCK: Manually set the colors and the legend order
+  scale_color_manual(
+    values = model_colors,
+    limits = model_order # Forces the legend items into this order
+  ) +
+  
+  # Add labels and theme
+  labs(
+    title = "ROC Curve Comparison for Attrition Prediction",
+    subtitle = "Threshold-Independent Performance",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity / Recall)",
+    color = "Model"
+  ) +
+  theme_minimal() +
+  coord_fixed() # Ensures the plot is square
+
+# Display the comparison plot
+print(roc_comparison_plot)
+```
+
